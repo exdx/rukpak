@@ -41,14 +41,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	rukpakv1alpha1 "github.com/operator-framework/rukpak/api/v1alpha1"
+	"github.com/operator-framework/rukpak/internal/decorator"
 	"github.com/operator-framework/rukpak/internal/storage"
 	"github.com/operator-framework/rukpak/internal/updater"
 	"github.com/operator-framework/rukpak/internal/util"
-)
-
-const (
-	bundleUnpackContainerName  = "bundle"
-	plainBundleProvisionerName = "plain"
 )
 
 // BundleReconciler reconciles a Bundle object
@@ -91,18 +87,19 @@ func (r *BundleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ c
 	}()
 	u.UpdateStatus(updater.EnsureObservedGeneration(bundle.Generation))
 
-	// switch bundle.Spec.Source.Type {
-	// case "image":
-	// 	stub
-	// case "git":
-	// 	stub
-	// default:
-	// 	// TODO: propagate invalid Bundle source type to status
-	// 	return ctrl.Result{Requeue: false}, fmt.Errorf("failed to parse Bundle source type: %s is an unsupported Bundle type", bundle.Spec.Source.Type)
-	// }
+	var d decorator.BundleContentDecorator
+	switch bundle.Spec.Source.Type {
+	case "image":
+		d = decorator.NewImageDecorator(bundle, r.PodNamespace, r.UnpackImage)
+	case "git":
+		d = decorator.NewGitDecorator(bundle, r.PodNamespace, r.UnpackImage)
+	default:
+		return ctrl.Result{Requeue: false}, updateStatusUnpackFailing(&u, fmt.Errorf("failed to parse Bundle "+
+			"source type: %s is an unsupported Bundle type", bundle.Spec.Source.Type))
+	}
 
-	pod := &corev1.Pod{}
-	if op, err := r.ensureUnpackPod(ctx, bundle, pod); err != nil {
+	pod := d.BuildPod(bundle)
+	if op, err := ensureUnpackPod(ctx, r.Client, pod); err != nil {
 		u.UpdateStatus(updater.SetBundleInfo(nil), updater.EnsureBundleDigest(""))
 		return ctrl.Result{}, updateStatusUnpackFailing(&u, fmt.Errorf("ensure unpack pod: %w", err))
 	} else if op == controllerutil.OperationResultCreated || op == controllerutil.OperationResultUpdated || pod.DeletionTimestamp != nil {
@@ -200,88 +197,8 @@ func (r *BundleReconciler) handleFailedPod(ctx context.Context, u *updater.Updat
 	return fmt.Errorf("unpack failed: %v", logStr)
 }
 
-func (r *BundleReconciler) ensureUnpackPod(ctx context.Context, bundle *rukpakv1alpha1.Bundle, pod *corev1.Pod) (controllerutil.OperationResult, error) {
-	controllerRef := metav1.NewControllerRef(bundle, bundle.GroupVersionKind())
-	automountServiceAccountToken := false
-	pod.SetName(util.PodName(plainBundleProvisionerName, bundle.Name))
-	pod.SetNamespace(r.PodNamespace)
-
-	// TODO: clean up implementation up -- just hacking around to get the core
-	// functionality working before introduction abstraction layers.
-	return util.CreateOrRecreate(ctx, r.Client, pod, func() error {
-		pod.SetLabels(map[string]string{
-			"core.rukpak.io/owner-kind": bundle.Kind,
-			"core.rukpak.io/owner-name": bundle.Name,
-		})
-		pod.SetOwnerReferences([]metav1.OwnerReference{*controllerRef})
-		pod.Spec.AutomountServiceAccountToken = &automountServiceAccountToken
-		pod.Spec.Volumes = []corev1.Volume{
-			{Name: "util", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-			{Name: "manifests", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		}
-		pod.Spec.RestartPolicy = corev1.RestartPolicyNever
-		if bundle.Spec.Source.Type == "git" {
-			// Note: use host networking (hack) so we can resolve https://github.com references in the
-			// Bundle's spec.Source.Git.Repository. Maybe we should revisit having the user inline https://github.com?
-			pod.Spec.HostNetwork = true
-		}
-
-		targetInitContainers := 1
-		if bundle.Spec.Source.Type == "git" {
-			targetInitContainers = 2
-		}
-		if len(pod.Spec.InitContainers) != targetInitContainers {
-			pod.Spec.InitContainers = make([]corev1.Container, targetInitContainers)
-		}
-		pod.Spec.InitContainers[0].Name = "install-unpack"
-		pod.Spec.InitContainers[0].Image = r.UnpackImage
-		pod.Spec.InitContainers[0].ImagePullPolicy = corev1.PullIfNotPresent
-		pod.Spec.InitContainers[0].Command = []string{"cp", "-Rv", "/unpack", "/util/unpack"}
-		pod.Spec.InitContainers[0].VolumeMounts = []corev1.VolumeMount{{Name: "util", MountPath: "/util"}}
-
-		// Note: initContainer so we can ensure the repository has been cloned
-		// at the bundle.Spec.Source.Git.Ref before we unpack the Bundle contents
-		// that are stored in the repository.
-		if bundle.Spec.Source.Type == "git" {
-			pod.Spec.InitContainers[1].Name = "clone-repository"
-			pod.Spec.InitContainers[1].Image = "bitnami/git:latest"
-			pod.Spec.InitContainers[1].ImagePullPolicy = corev1.PullIfNotPresent
-			// TODO: length check
-			// TODO: function responsible for determine which ref to use
-			// TODO: bundle unpack failing silently when pod log stream is empty (e.g. `{}`)
-			// TODO: bundle has an image custom column -- maybe we need a source type configuration instead?
-			// TODO: bundleinstance reporting a successful installation state despite installing nothing.
-			source := bundle.Spec.Source.Git
-			repository := source.Repository
-			directory := "./manifests"
-			if source.Directory != "" {
-				directory = source.Directory
-			}
-			checkedCommand := fmt.Sprintf("git clone %s && cd %s && git checkout %s && cp -r %s/* /manifests", repository, strings.Split(repository, "/")[4], source.Ref.Commit, directory)
-			pod.Spec.InitContainers[1].Command = []string{"/bin/bash", "-c", checkedCommand}
-			pod.Spec.InitContainers[1].VolumeMounts = []corev1.VolumeMount{{Name: "util", MountPath: "/util"}, {Name: "manifests", MountPath: "/manifests"}}
-		}
-
-		if len(pod.Spec.Containers) != 1 {
-			pod.Spec.Containers = make([]corev1.Container, 1)
-		}
-
-		if bundle.Spec.Source.Type == "image" {
-			pod.Spec.Containers[0].Name = bundleUnpackContainerName
-			pod.Spec.Containers[0].Image = bundle.Spec.Source.Image.Ref
-			pod.Spec.Containers[0].ImagePullPolicy = corev1.PullAlways
-			pod.Spec.Containers[0].Command = []string{"/util/unpack", "--bundle-dir", "/manifests"}
-			pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "util", MountPath: "/util"}}
-			return nil
-		}
-		if bundle.Spec.Source.Type == "git" {
-			pod.Spec.Containers[0].Name = bundleUnpackContainerName
-			pod.Spec.Containers[0].Image = "bitnami/git:latest"
-			pod.Spec.Containers[0].ImagePullPolicy = corev1.PullAlways
-			pod.Spec.Containers[0].Command = []string{"/util/unpack", "--bundle-dir", "/manifests"}
-			pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "util", MountPath: "/util"}, {Name: "manifests", MountPath: "/manifests"}}
-			return nil
-		}
+func ensureUnpackPod(ctx context.Context, client client.Client, pod *corev1.Pod) (controllerutil.OperationResult, error) {
+	return util.CreateOrRecreate(ctx, client, pod, func() error {
 		return nil
 	})
 }
@@ -392,7 +309,7 @@ func (r *BundleReconciler) getPodLogs(ctx context.Context, pod *corev1.Pod) ([]b
 
 func (r *BundleReconciler) getBundleImageDigest(pod *corev1.Pod) (string, error) {
 	for _, ps := range pod.Status.ContainerStatuses {
-		if ps.Name == bundleUnpackContainerName && ps.ImageID != "" {
+		if ps.Name == util.BundleUnpackContainerName && ps.ImageID != "" {
 			return ps.ImageID, nil
 		}
 	}

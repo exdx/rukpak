@@ -24,6 +24,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
+const (
+	BundleUnpackContainerName  = "bundle"
+	PlainBundleProvisionerName = "plain"
+)
+
 func BundleProvisionerFilter(provisionerClassName string) predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		b := obj.(*rukpakv1alpha1.Bundle)
