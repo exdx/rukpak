@@ -49,6 +49,7 @@ type BundleSpec struct {
 
 type BundleSource struct {
 	// Type defines the kind of Bundle content being sourced.
+	// +kubebuilder:validation:Enum=image,git
 	Type string `json:"type"`
 	// Image is the bundle image that backs the content of this bundle.
 	Image *ImageSource `json:"image,omitempty"`
