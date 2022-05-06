@@ -154,8 +154,8 @@ func mutate(f controllerutil.MutateFn, key client.ObjectKey, obj client.Object) 
 	return nil
 }
 
-func MergeMaps(maps ...map[string]string) map[string]string {
-	out := map[string]string{}
+func MergeMaps[K, V comparable](maps ...map[K]V) map[K]V {
+	out := make(map[K]V)
 	for _, m := range maps {
 		for k, v := range m {
 			out[k] = v
